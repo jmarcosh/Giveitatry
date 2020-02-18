@@ -1,0 +1,403 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages
+
+```{r Packages, include=FALSE}
+library(tidyverse)
+library(fastDummies)
+library(xgboost)
+library(caret)
+library(e1071)
+```
+
+Step 1 -
+We'll start by dividing our sample evenly into a "main" and "auxiliary" sample. To avoid overfitting following Deryugina et. al."to avoid overfitting, we won't allow the same individual to appear in the main and auxiliary sample
+(we have 2 observations for each individual - first and last CPS basic monthly survey applied). The random assignment is made at the person level and not the person-month in sample level.
+
+
+```{r Dividing the sample, echo=FALSE}
+load("~/Giveitatry/tree_dataset.Rda")
+
+colnames(tree_dataset)[c(2,4,5,6,7,9,14)] <- c("cbsa", "occ_2st", "occ", "ind_2st", "ind", "year", "age")
+tree_dataset <- tree_dataset[complete.cases(tree_dataset[ , 22]),]
+
+
+set.seed(123)
+PID <- tree_dataset %>% group_by(PID) %>% summarise()
+
+PID_aux <- PID %>% sample_frac(.5)
+PID_main <- anti_join(PID, PID_aux, by='PID')
+
+tree_dataset <- tree_dataset  %>%
+                 select(PID, inc, self, uninc, year, cbsa, occ, ind, age, treat, hs, somecol, col,  
+                 grad, female, black, asian, hispanic, foreign, married, neshare_g, pwsswgt)
+                 
+
+
+aux <- tree_dataset %>% right_join(PID_aux, by='PID')
+main <- tree_dataset %>% right_join(PID_main, by='PID')
+main <- main[complete.cases(main[ , 22]),]
+
+R = length(aux$inc[aux$inc == 0]) / length(aux$inc[aux$inc == 1]) 
+save(R, file = "R.rda")
+
+saveRDS(aux, "auxi.Rda")
+   
+remove(PID_aux, PID_main, PID, tree_dataset)
+
+
+```
+
+Step 2 -
+Estimate the model on the auxiliar sample separately for treatment and control.
+
+CHALLENGE - the probability of being an entrpreneur is small. For this model we are considering that entrepreneur = incorporated self-employed.
+
+SOLUTION - downsampling to predict entrepreneurship. Deryugina et al randomly match the number of inc = 0 to the number of inc = 1 in the auxiliary sample to get a perfectly balanced sample.
+
+We are unsure if the downsampling should incorporate the weights. We didn't consider the weights when sampling inc=0
+
+```{r Dummy variables, echo=FALSE}
+
+aux_inc_1 <- aux %>% filter(inc==1)
+aux_inc_0 <- aux %>% filter(inc==0) %>% sample_n(nrow(aux_inc_1))
+aux_bal <- rbind(aux_inc_0, aux_inc_1)      
+remove(aux_inc_1, aux_inc_0)
+nr = nrow(aux_bal)
+
+#The share of treated observations in the aux sample is
+sum(aux$treat)/nrow(aux)
+#While the share of treated observations in the downsampled sample is
+sum(aux_bal$treat)/nrow(aux_bal)
+
+#Is this a first sign of a positive correlation between the treatment and the outcome? As we reduce the number of not incorporated in the sample the share of treated increase. 
+
+#Creating the dummy variables for the 18 years of the sample, 260 statistical areas, 264 four industry codes and 546 four occupation codes. Initially we thought about including interaction terms between the industry and occupation codes but we found evidence supporting that opposed to linear models, random forests are very good at finding  interactions with no need of specifying them.
+
+main <- rbind(aux_bal, main)
+remove(aux, aux_bal)
+
+main <- main %>% dummy_cols(c("year", "cbsa", "occ", "ind")) 
+
+aux_bal <- main[1:nr,]
+main <- main[nr+1:nrow(main),]
+
+saveRDS(main, "main.Rda")
+remove(main, nr)
+saveRDS(aux_bal, "aux_bal.Rda")
+
+
+
+
+```
+
+Deryugina et al (2019) following Einav et al (2018) use the Chen and Guestrin (2016) gradient-boosted decision tree algorithm XGBoost, which sequentially adjusts the prediction for each leaf using the residuals multiplied by a learning rate to reduce prediction error.
+
+An advantage of the CDDF method is that any ML model can be used for estimating heterogeneity.
+
+We will also use the XGBoost algorithm that minimized the MSE on Problem Set 3.
+
+Let's start. We set aside 10% of the auxiliary sample for calibrating the incorporated probability and train the machine learning models on the remaining 90%.
+
+```{r XGB model estimation}
+
+set.seed(123)
+index <- sample(seq(nrow(aux_bal)), .9*nrow(aux_bal))
+#On this set we are running the model
+aux_bal_90 <-  aux_bal[index,]
+#This is the calibration set
+aux_bal_10 <- aux_bal[-index,]
+  
+aux_bal_90_tr <- aux_bal_90 %>% filter(treat==1)
+aux_bal_90_co <- aux_bal_90 %>% filter(treat==0)
+
+
+d90_tr <- xgb.DMatrix(data = as.matrix(aux_bal_90_tr[,-c(1:8, 10, 22)]), 
+                           label = aux_bal_90_tr$inc)
+
+xgb90_tr <- xgboost(data = d90_tr, max.depth = 100, eta = .3, nthread = 2, nrounds = 20, 
+                                  objective = "binary:logistic", verbose = 1, weight = aux_bal_90_tr$pwsswgt)
+save(xgb90_tr, file = "xgb_tr.rda")
+saveRDS(pr_xgb_10_tr, file = "pr_xgb_10_tr.Rda")
+
+d90_co <- xgb.DMatrix(data = as.matrix(aux_bal_90_co[,-c(1:8, 10, 22)]), 
+                           label = aux_bal_90_co$inc)
+
+
+xgb90_co <- xgboost(data = d90_co, max.depth = 100, eta = .3, nthread = 2, nrounds = 20, 
+                                  objective = "binary:logistic", verbose = 1, weight = aux_bal_90_co$pwsswgt)
+
+save(xgb90_co, file = "xgb_co.rda")
+saveRDS(pr_xgb_10_co, file = "pr_xgb_10_co.Rda")
+
+remove(d90_co, d90_tr, aux_bal, aux_bal_90, aux_bal_90_co, aux_bal_90_tr, index)
+
+#Predictions on the calibration set
+aux_bal_10_tr <- aux_bal_10 %>% filter(treat==1)
+aux_bal_10_co <- aux_bal_10 %>% filter(treat==0)
+
+
+pr_xgb_10_tr <- predict(xgb90_tr, newdata = as.matrix(aux_bal_10_tr[,-c(1:8, 10, 22)]))
+pr_xgb_10_co <- predict(xgb90_co, newdata = as.matrix(aux_bal_10_co[,-c(1:8, 10, 22)]))
+
+#We want to know the MSE for both models, before running the polynomial regression for calibrating the downsampled sample.
+
+mse_xgb_tr <- mean((pr_xgb_10_tr - aux_bal_10_tr$inc)^2)
+mse_xgb_tr
+mse_xgb_co <- mean((pr_xgb_10_co - aux_bal_10_co$inc)^2)
+mse_xgb_co
+
+remove(mse_xgb_tr, mse_xgb_co)
+
+#Because the entrepreneurship rate in the subsample is exactly 50% , our predictions are bias upward and need to be adjusted. We again follow Einav et al. (2018) for corecting for this bias.
+
+cubic_tr <- lm(aux_bal_10_tr$inc ~ poly(pr_xgb_10_tr,3), weights = aux_bal_10_tr$pwsswgt)
+save(cubic_tr, file = "cubic_tr.rda")
+
+predicted <-  as.factor(ifelse(pr_xgb_10_tr > 0.50, 1, 0))
+actual <- as.factor(aux_bal_10_tr$inc)
+confusionMatrix(predicted, actual)
+
+cubic_co <- lm(aux_bal_10_co$inc ~ poly(pr_xgb_10_co,3), weights = aux_bal_10_co$pwsswgt)
+save(cubic_co, file =  "cubic_co.rda")
+
+predicted <-  as.factor(ifelse(pr_xgb_10_co > 0.50, 1, 0))
+actual <- as.factor(aux_bal_10_co$inc)
+confusionMatrix(predicted, actual)
+
+
+remove(aux_bal_10, aux_bal_10_co, aux_bal_10_tr, predicted, actual, pr_xgb_10_co, pr_xgb_10_tr, cubic_co, cubic_tr, xgb90_co, xgb90_tr)
+
+```
+
+Step 3 - Predict outcomes for observations in the main sample using the calibrated estimates obtained from the treatment and control XGB algorithm.
+
+
+```{r Predictions for the main sample observations, echo=FALSE}
+
+main <- readRDS("main.Rda")
+
+
+#Given memory constraints we will split the main sample and at the end join the differences vector of step 4.
+#set.seed(1)
+#index <- sample(seq(nrow(main)), .5*nrow(main))
+#main1 <- main[index,]
+main1 <- main[c(1:((nrow(main)+1)/2)),] #dividing the sample by rows for binding the columns to the main sample
+saveRDS(main1, "main1.Rda")
+
+#main2 <- main[-index,]
+main2 <- main[c(((nrow(main)+3)/2):nrow(main)),]
+saveRDS(main2, "main2.Rda")
+remove(main, main2, index)
+
+load("~/Giveitatry/xgb_tr.rda")
+pr_xgb_main_tr1 <- predict(xgb90_tr, newdata = as.matrix(main1[,-c(1:8, 10, 22)]))
+
+load("~/Giveitatry/xgb_co.rda")
+pr_xgb_main_co1 <- predict(xgb90_co, newdata = as.matrix(main1[,-c(1:8, 10, 22)]))
+
+remove(main1, xgb90_co, xgb90_tr)
+
+#We will use the cubic polynomial model... 
+
+load("~/Giveitatry/cubic_tr.rda")
+pr_cubic_xgb_main_tr1 <- predict(cubic_tr, newdata = data.frame(pr_xgb_10_tr = pr_xgb_main_tr1))
+
+load("~/Giveitatry/cubic_co.rda")
+pr_cubic_xgb_main_co1 <- predict(cubic_co, newdata = data.frame(pr_xgb_10_co = pr_xgb_main_co1))
+
+remove(cubic_co, cubic_tr, pr_xgb_main_co1, pr_xgb_main_tr1)
+
+#... and the Bayesian correction formula for adjusting the predictions.
+
+load("~/Giveitatry/R.rda")
+
+pred_inc_tr1 <- pr_cubic_xgb_main_tr1 / (R - (R-1)*pr_cubic_xgb_main_tr1)
+pred_inc_co1 <- pr_cubic_xgb_main_co1 / (R - (R-1)*pr_cubic_xgb_main_co1)
+
+
+
+```
+
+Step 4 - Calculate the differences between the 2 predicitions
+The proxy predictor S_hat is a possibly biased and inconsistent estimate of the conditional average treatment effect function S_0. Nevertheless, Chernozhukov, Demirer, Duflo, and Fernandez-Va, from now on CDDF show that the researcher can use S_hat to extract properties pf S_0. In the next step we will identify BLP[S_0|S_hat], the best linear prediction of S_0 using S_hat.
+
+```{r Calculating S_hat}
+
+S_hat1 <- pred_inc_tr1 - pred_inc_co1
+
+saveRDS(pred_inc_tr1, file = "pred_inc_tr1.Rda")
+saveRDS(pred_inc_tr1, file = "pred_inc_tr1.Rda")
+saveRDS(S_hat1, file = "S_hat1.Rda")
+rm(list = ls(all.names = TRUE))
+gc()
+
+```
+
+We will repeat step 3 and 4 on the second part of the main sample to get S_hat for all the observations of the main sample.
+
+```{r Repeting steps 3 and 4 for the second part of the main sample}
+
+main2 <- readRDS("main2.Rda")
+load("~/Giveitatry/xgb_tr.rda")
+pr_xgb_main_tr2 <- predict(xgb90_tr, newdata = as.matrix(main2[,-c(1:8, 10, 22)]))
+
+load("~/Giveitatry/xgb_co.rda")
+pr_xgb_main_co2 <- predict(xgb90_co, newdata = as.matrix(main2[,-c(1:8, 10, 22)]))
+
+remove(main2, xgb90_co, xgb90_tr)
+
+#We will use the cubic polynomial model... 
+
+load("~/Giveitatry/cubic_tr.rda")
+pr_cubic_xgb_main_tr2 <- predict(cubic_tr, newdata = data.frame(pr_xgb_10_tr = pr_xgb_main_tr2))
+
+load("~/Giveitatry/cubic_co.rda")
+pr_cubic_xgb_main_co2 <- predict(cubic_co, newdata = data.frame(pr_xgb_10_co = pr_xgb_main_co2))
+
+remove(cubic_co, cubic_tr, pr_xgb_main_co2, pr_xgb_main_tr2)
+
+#... and the Bayesian correction formula for adjusting the predictions.
+
+load("~/Giveitatry/R.rda")
+
+pred_inc_tr2 <- pr_cubic_xgb_main_tr2 / (R - (R-1)*pr_cubic_xgb_main_tr2)
+pred_inc_co2 <- pr_cubic_xgb_main_co2 / (R - (R-1)*pr_cubic_xgb_main_co2)
+
+
+S_hat2 <- pred_inc_tr2 - pred_inc_co2
+
+saveRDS(pred_inc_tr2, file = "pred_inc_tr2.Rda")
+saveRDS(pred_inc_co2, file = "pred_inc_co2.Rda")
+saveRDS(S_hat2, file = "S_hat2.Rda")
+
+
+pred_inc_tr_1 <- readRDS("pred_inc_tr1.Rda")
+pred_inc_co_1 <- readRDS("pred_inc_co1.Rda")
+S_hat1 <- readRDS("S_hat1.Rda")
+
+pred_inc_tr <- c(pred_inc_tr1, pred_inc_tr1)
+pred_inc_co <- c(pred_inc_co1, pred_inc_co1)
+S_hat <- c(S_hat1, S_hat2)
+
+saveRDS(pred_inc_tr, file = "pred_inc_tr.Rda")
+saveRDS(pred_inc_tr, file = "pred_inc_co.Rda")
+saveRDS(S_hat, file = "S_hat.Rda")
+
+remove(pr_cubic_xgb_main_co2, pr_cubic_xgb_main_tr2, pred_inc_co1, pred_inc_tr1, pred_inc_co2, pred_inc_tr2, R, S_hat1, S_hat2)
+
+
+main <- readRDS("main.Rda")
+main$S_hat <- S_hat
+main$pred_inc_co <- pred_inc_co
+remove(pred_inc_co, pred_inc_tr, S_hat)
+
+main <- main[complete.cases(main[ , 22]),]
+
+#Even that S_hat is only a proxy predictor of the CATE, which is going to be used further for developing valid inference on features of the CATE, we think it can provide an estimator for the ATE. The main concern of using this proxy is that it's noisy, but given the large sample we can be confident that on average it can provide information about the ATE  
+
+#Another aspect to remark is that  that according to CDDF considering many different splits and accounting for variability caused by splitting is very important repetitions. They suggest to report the median of the estimated key features over different random splits of the data. 
+
+#Indeed, with a single splitting practice, empiricists may unintentionally look for a ”good” data split, which supports their prior beliefs about the likely results, thereby invalidating inference.
+
+#Given that the estimation is computationally burdensome, and relying on the size of our sample we will use one estimation only following Deryugina et al.
+
+ATE <- weighted.mean(main$S_hat, main$pwsswgt)
+ATE_SD <- sqrt((1/sum(main$pwsswgt))*sum(main$pwsswgt * (main$S_hat - ATE)^2))
+ATE_SD
+ATE/ATE_SD
+
+saveRDS(main, file = "main.Rda")
+
+```
+
+Step 5 - We will estimate the BLP of S_0. Unlike CDDF who assume that p(Z), the probability of treatment, is known. Their method is developed for RCTs. 
+
+The propensity score estimation is done on the auxiliar sample as we did on step 2 for estimating incorporated employment. 
+
+Three differences are made. 
+a) On this case, we are not dividing the sample between treatment and control.
+b)Given that the probabiliy of treatment is around 50% we can avoid the downsampling and the calibration part
+c)Taking advantage of the fact that this sample is higher than the balanced sample, we can reduce the depth of the boost algorithm to 50 instead of 100 and the rounds to 5 instead of 20.
+
+We are doing the estimation on 50% of the auxiliar sample to save on computing time and memory.
+
+
+```{r Estimation of the propensity scores}
+
+aux_prop <- readRDS("auxi.Rda") %>% sample_frac(.5) %>% dummy_cols(c("year", "cbsa", "occ", "ind"))
+setdiff(aux_bal, aux_prop) #Add the cols that don't appear in rand_aux  to have the same vars for prediction
+aux_prop <- aux_prop %>% cbind("occ_6540" = 0, "occ_1660" = 0, "occ_7440" = 0).
+
+d_prop <- xgb.DMatrix(data = as.matrix(aux_prop[,-c(1:8, 10, 22)]), 
+                           label = aux_prop$treat)
+
+xgb_prop <- xgboost(data = d_prop, max.depth = 50, eta = .3, nthread = 2, nrounds = 5, 
+                                  objective = "binary:logistic", verbose = 1, weight = aux_prop$pwsswgt)
+
+save(xgb_prop, file = "xgb_prop.rda")
+saveRDS(aux_prop, file = "aux_prop.Rda")
+
+remove(aux_prop, d_prop)
+
+```
+
+Step 6 - Prediction of the propensity scores on the main sample. 
+
+```{r}
+
+load("~/Giveitatry/xgb_prop.rda")
+main1 <- readRDS("main1.Rda")
+pr_xgb_main_pr1 <- predict(xgb_prop, newdata = as.matrix(main1[,-c(1:8, 10, 22)]))
+
+remove(main1)
+
+main2 <- readRDS("main2.Rda")
+pr_xgb_main_pr2 <- predict(xgb_prop, newdata = as.matrix(main2[,-c(1:8, 10, 22)]))
+
+remove(main2, xgb90_co, xgb90_tr)
+
+#We will use the cubic polynomial model... 
+
+load("~/Giveitatry/cubic_tr.rda")
+pr_cubic_xgb_main_tr2 <- predict(cubic_tr, newdata = data.frame(pr_xgb_10_tr = pr_xgb_main_tr2))
+
+load("~/Giveitatry/cubic_co.rda")
+pr_cubic_xgb_main_co2 <- predict(cubic_co, newdata = data.frame(pr_xgb_10_co = pr_xgb_main_co2))
+
+remove(cubic_co, cubic_tr, pr_xgb_main_co2, pr_xgb_main_tr2)
+
+#... and the Bayesian correction formula for adjusting the predictions.
+
+load("~/Giveitatry/R.rda")
+
+pred_inc_tr2 <- pr_cubic_xgb_main_tr2 / (R - (R-1)*pr_cubic_xgb_main_tr2)
+pred_inc_co2 <- pr_cubic_xgb_main_co2 / (R - (R-1)*pr_cubic_xgb_main_co2)
+
+
+S_hat2 <- pred_inc_tr2 - pred_inc_co2
+
+
+saveRDS(S_hat2, file = "S_hat2.Rda")
+
+remove(pr_cubic_xgb_main_co2, pr_cubic_xgb_main_tr2, pred_inc_co2, pred_inc_tr2, R)
+
+S_hat1 <- readRDS("S_hat1.Rda")
+
+S_hat <- c(S_hat1, S_hat2)
+saveRDS(S_hat, file = "S_hat.Rda")
+
+remove(S_hat1, S_hat2)
+
+main <- readRDS("main.Rda")
+main$S_hat <- S_hat
+remove(S_hat)
+```
+
